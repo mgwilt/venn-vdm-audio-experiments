@@ -276,6 +276,12 @@ def main(argv=None):
     fetch.add_argument("--model-dir", default=".venn-audio/models")
     fetch.add_argument("--teacher", choices=("parakeet", "none"), default="parakeet")
     sub.add_parser("devices", help="List microphone devices")
+    evaluate = sub.add_parser("evaluate", help="Benchmark adaptation on separate audio without a microphone")
+    evaluate.add_argument("--model-dir", default=".venn-audio/models")
+    evaluate.add_argument("--device", choices=("auto", "cpu", "gpu"), default="auto")
+    evaluate.add_argument("--manifest", type=Path, help="Annotated train/test WAV manifest; default generates speech on macOS")
+    evaluate.add_argument("--output", type=Path, help="New report directory; default .venn-audio/evaluations/TIMESTAMP")
+    evaluate.add_argument("--seed", type=int, default=17)
     for name in ("file", "mic", "benchmark"):
         child = sub.add_parser(name)
         child.add_argument("--model-dir", default=".venn-audio/models")
@@ -310,6 +316,9 @@ def main(argv=None):
             replay(args)
         elif args.mode == "mic":
             microphone(args)
+        elif args.mode == "evaluate":
+            from venn.audio.evaluate import run
+            run(args)
         else:
             benchmark(args)
     except (ValueError, RuntimeError, OSError, wave.Error) as error:

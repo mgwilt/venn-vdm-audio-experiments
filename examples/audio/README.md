@@ -108,6 +108,55 @@ you have checked; a whole utterance may contain pauses that should remain
 background. Every interval must include a full frame and fit within completed
 audio; incomplete final frames are reported and discarded rather than padded.
 
+### Evaluation without a microphone
+
+```sh
+venn-vad evaluate
+venn-vad evaluate --manifest path/to/manifest.json --output .venn-audio/evaluations/replay
+```
+
+The default suite uses macOS speech synthesis. It does not play or capture audio.
+It tests clean speech, quiet speech, two noise levels (10 and 0 dB SNR), and a new voice.
+Training and test sentences differ. Each condition starts with empty memory.
+Parakeet labels training audio. The test phase disables teaching and uses a fixed checkpoint.
+The baseline, memory policy, and compiled policy process the same test frames with reset readers.
+
+Reference labels come from clean speech energy before mixing. Quiet frames inside
+utterances and uncertain boundaries are excluded. Inserted gaps are background,
+including gaps with noise. This is a synthetic regression test, not human-labeled accuracy.
+The noise seed is fixed. Generated voices can differ across macOS versions; reuse the
+saved manifest and WAVs for exact inputs.
+
+Each run saves `report.json`, teacher events, checkpoints, and per-frame predictions.
+The report includes F1, false-positive and miss rates, error duration, and frame timings.
+It scores both raw decisions and the live speech gate. Gate scores do not credit
+retrospective boundary timestamps. Timings exclude model loading, transcription, and capture.
+Decision-source counts show when a policy falls back to the baseline or memory.
+The summary averages each condition equally. Training waits for teacher results;
+this test does not measure live teacher contention or microphone latency.
+
+For real recordings, supply a JSON manifest. WAV paths are relative to the manifest.
+Use mono 16 kHz PCM16. Speech and ignore intervals use seconds. Unmarked test audio
+is background. Mark all speech, and keep training and test recordings separate.
+Training annotations are not used to teach the model.
+
+```json
+{
+  "schema": 1,
+  "reference_kind": "human_annotations",
+  "cases": [{
+    "name": "office",
+    "train": {"wav": "train.wav"},
+    "test": {"wav": "test.wav", "speech": [[1.024, 2.048]], "ignore": []}
+  }]
+}
+```
+
+Intervals must fit within complete 32 ms frames of the recording. Frames that
+cross an annotation boundary are excluded. Optional `sha256` fields verify WAV files.
+Identical training and test files are rejected. Avoid overlapping content across
+different files; file hashes cannot detect that leakage.
+
 ### Automatic supervision
 
 The pinned Parakeet TDT v3 teacher runs in a spawned process with its own MLX

@@ -42,6 +42,7 @@ Use uncompressed mono 16 kHz PCM16 WAV files.
 venn-vad file recording.wav --checkpoint .venn-audio/session.npz
 venn-vad file recording.wav --teacher none --policy compiled --checkpoint .venn-audio/session.npz
 venn-vad benchmark --seconds 30
+venn-vad evaluate
 ```
 
 | Option | Function |
@@ -56,6 +57,10 @@ venn-vad benchmark --seconds 30
 
 Offline replay waits for teacher results. Live decisions do not wait for transcription.
 The benchmark measures inference on synthetic silence. It does not measure VAD accuracy.
+`evaluate` needs no microphone. It generates speech and noise, learns from separate training audio,
+and compares the frozen baseline, Venn memory, and compiled heads on test audio.
+It saves accuracy scores, frame timings, and fixtures in `.venn-audio/evaluations/`.
+These synthetic tests do not establish real-world accuracy. Use `--manifest` for annotated recordings.
 
 ## Memory and labels
 
@@ -94,7 +99,7 @@ The streaming API is separate from Venn's HTTP API.
 ## Develop
 
 ```sh
-python -m pytest tests/test_audio_memory.py tests/test_audio_teacher.py tests/test_streaming_vad.py -q
+python -m pytest tests/test_audio_memory.py tests/test_audio_teacher.py tests/test_audio_evaluate.py tests/test_streaming_vad.py -q
 python -m pyflakes venn scripts examples tests
 python scripts/check_docs.py
 python scripts/update_doc_navigation.py --check
