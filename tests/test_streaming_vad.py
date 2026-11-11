@@ -229,3 +229,121 @@ def test_microphone_callback_handoff_and_overflow_stop(monkeypatch, capsys, over
         cli.microphone(SimpleNamespace(input_device=None))
         assert sum(e['type'] == 'frame' for e in events) == 1
     assert any(e['type'] == 'end' for e in events)
+
+
+def test_feedback_changes_memory_decision_before_any_training():
+    state = VADSession(Reader(), device="cpu")
+    first = state.push(pcm(-10000, 16))[-1]
+    assert first["decision"]["source"] == "baseline"
+    assert first["decision"]["memory"]["abstained"]
+    assert first["decision"]["answer"] == "speech"
+    weights_before = state.head.arrays()
+    state.feedback(0, .512, "background")
+    next_frame = state.push(pcm(-10000))[0]
+    assert next_frame["decision"]["source"] == "memory"
+    assert next_frame["decision"]["answer"] == "background"
+    assert next_frame["decision"]["probabilities"] is None  # Neighborhood agreement is not a probability.
+    assert next_frame["decision"]["cases"]
+    assert next_frame["version"] == 0
+    for before, after in zip(weights_before, state.head.arrays()):
+        np.testing.assert_array_equal(before, after)
+
+
+def test_multiple_questions_and_requery_reuse_the_same_audio_vectors(tmp_path):
+    class CountingReader(Reader):
+        calls = 0
+
+        def encode(self, samples):
+            self.calls += 1
+            return super().encode(samples)
+
+    reader = CountingReader()
+    state = VADSession(reader, device="cpu", include_vectors=True)
+    frames = state.push(pcm(-10000, 16))
+    state.register_question("sound", ["fan", "keyboard"])
+    state.feedback(0, .512, "background")
+    state.feedback(0, .512, "keyboard", question="sound")
+    answers = state.ask(0, .512)
+    assert reader.calls == 16
+    assert answers[0]["answers"]["vad"]["answer"] == "background"
+    assert answers[0]["answers"]["sound"]["answer"] == "keyboard"
+    assert len(frames[0]["state"]["vector"]) == DIMENSIONS
+    assert frames[0]["state"]["tag"]["fields"] == ["audio"]
+    path = tmp_path / "questions.npz"
+    state.save(path)
+    restored = VADSession(Reader(), device="cpu", checkpoint=path)
+    event = restored.push(pcm(-10000))[0]
+    assert event["questions"]["sound"]["answer"] == "keyboard"
+    assert event["questions"]["vad"]["answer"] == "background"
+    assert {case["id"] for case in event["decision"]["cases"]} <= {f["state"]["id"] for f in frames}
+
+
+def test_compiled_policy_is_invalidated_by_new_feedback():
+    state = VADSession(Reader(), device="cpu", policy="compiled")
+    state.push(pcm(-10000, 16))
+    state.push(pcm(10000, 16))
+    state.feedback(0, .512, "background")
+    state.feedback(.512, 1.024, "speech")
+    result = state.learn()
+    assert result["accepted"] and result["objective"] == "compile_memory_policy"
+    assert result["head_revision"] == result["memory_revision"]
+    assert state.push(pcm(-10000))[0]["decision"]["source"] == "compiled"
+    state.feedback(0, .512, "speech")
+    corrected = state.push(pcm(-10000))[0]["decision"]
+    assert corrected["source"] == "memory" and corrected["answer"] == "speech"
+    assert not corrected["head_current"]
+
+
+def test_custom_question_abstains_and_feedback_command_targets_it():
+    state = VADSession(Reader(), device="cpu")
+    state.register_question("sound", ["fan", "keyboard"])
+    event = state.push(pcm(-10000, 16))[-1]
+    assert event["questions"]["sound"]["answer"] == "none"
+    feedback = command(state, 'label sound keyboard 0.512')
+    assert feedback[0]["question"] == "sound"
+    assert command(state, 'ask sound')[0]["results"][0]["answers"]["sound"]["answer"] == "keyboard"
+    assert state.questions["vad"].store.counts() == [0, 0]
+    with pytest.raises(ValueError, match="labels"):
+        state.register_question("sound", ["different", "labels"])
+
+
+def test_legacy_checkpoint_migrates_labels_but_not_a_false_compilation_claim(tmp_path):
+    state = VADSession(Reader(), device="cpu")
+    x, _ = Reader().encode(np.full(FRAME, -.3, np.float32))
+    W, b = state.head.arrays()
+    path = tmp_path / 'legacy.npz'
+    np.savez(path, W=W, b=b, X=x[None], y=np.array([0], np.int32), keys=np.array(['legacy:512']),
+             metadata=json.dumps({'schema': 1, 'profile': PROFILE, 'labels': ['background', 'speech'],
+                                  'version': 3, 'temperature': 1.0}))
+    restored = VADSession(Reader(), device="cpu", checkpoint=path, policy="compiled")
+    event = restored.push(pcm(-10000))[0]
+    assert restored.version == 3
+    assert event["decision"]["source"] == "memory"
+    assert event["decision"]["answer"] == "background"
+    assert restored.questions["vad"].head_revision is None
+    restored.save(path)
+    with np.load(path, allow_pickle=False) as saved:
+        assert json.loads(str(saved['metadata'].item()))['schema'] == 2
+
+
+def test_compiled_head_runs_without_querying_the_live_store(tmp_path, monkeypatch):
+    state = VADSession(Reader(), device="cpu", policy="compiled")
+    state.push(pcm(-10000, 16))
+    state.push(pcm(10000, 16))
+    state.feedback(0, .512, "background")
+    state.feedback(.512, 1.024, "speech")
+    assert state.learn()["accepted"]
+    path = tmp_path / 'compiled.npz'
+    state.save(path)
+    restored = VADSession(Reader(), device="cpu", policy="compiled", checkpoint=path)
+    monkeypatch.setattr(restored.questions['vad'].store, 'search', lambda *a, **kw: pytest.fail('Live store queried'))
+    result = restored.push(pcm(-10000))[0]['decision']
+    assert result['source'] == 'compiled'
+    assert result['memory'] is None and result['evidence'] is None
+    assert result['compilation']['cases'] == 32
+    # Unknown vectors use the frozen detector; stale store statistics are never invented.
+    unseen = np.zeros(DIMENSIONS, np.float32)
+    unseen[5] = 1
+    result = restored._answers(unseen, .2)['vad']
+    assert result['source'] == 'baseline'
+    assert result['compiled']['reason'] == 'outside_compiled_coverage'

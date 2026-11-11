@@ -11,6 +11,8 @@ from urllib.request import urlopen
 
 import numpy as np
 
+from venn.profiles import VectorTag
+
 REVISION = "be95df9152c0d7618fa1edfeb296fc3dae32376f"
 MODEL_SHA256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
 LICENSE_SHA256 = "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b"
@@ -26,6 +28,7 @@ PROFILE = {
     "sample_rate": RATE,
     "frame_samples": FRAME,
 }
+AUDIO_TAG = VectorTag(PROFILE["profile"], REVISION, PROFILE["representation"], DIMENSIONS, ("audio",))
 
 
 def _verify(path, digest):

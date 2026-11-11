@@ -29,9 +29,10 @@
 
 ## Streaming VAD on Apple Silicon
 
-The local VAD path uses an MLX port of **Venn's linear Choice head**. It processes
-32 ms frames of mono 16 kHz PCM16 audio and emits speech/background decisions,
-speech boundaries, the frozen baseline score, and the active classifier version.
+The local VAD path uses **Venn's OutcomeService** over labeled audio memory and
+compiles that memory's decisions into MLX linear Choice heads. It processes
+32 ms frames of mono 16 kHz PCM16 audio and emits tagged states, named decisions,
+supporting evidence, speech boundaries, and the frozen baseline score.
 The audio path does not import Torch or load the text reader.
 
 Set up on an Apple Silicon Mac with Python 3.12:
@@ -65,11 +66,14 @@ learning), or `quit`. Exact intervals are also accepted:
 ```
 
 The classifier **learns from explicit feedback**, not from its own predictions.
-It starts with useful frozen-detector behavior, requires at least eight labeled
-frames of each class before training, and retains at most 256 examples per class.
+It starts with frozen-detector behavior. Corrections immediately affect memory;
+head compilation requires at least eight supported memory-policy targets per
+class. Each question retains at most 256 examples per class.
 Feedback must refer to the retained last 60 seconds; relabeling the same frame
 replaces its previous label. Checkpoints preserve the learned head and labeled
-feature memory across sessions. They do not preserve the audio stream's recurrent
+feature memory, question definitions, and compilation revisions across sessions.
+Legacy checkpoints migrate their examples, but their heads need recompilation
+before use with `--policy compiled`. Checkpoints do not preserve the audio stream's recurrent
 state or timeline. Features may carry information about the source audio.
 
 For repeatable experiments, replay a WAV with optional timestamped feedback:
@@ -102,18 +106,46 @@ audio; incomplete final frames are reported and discarded rather than padded.
 - `MLXLinearChoiceHead` in `venn/heads/mlx_choice.py` implements the same
   `state @ W.T + b` logits and temperature-scaled softmax as Venn's existing
   `LinearChoiceHead` in `venn/heads/linear_choice.py`. Registered labels are bound
-  once. The initial weights reproduce the frozen speech estimate; the Venn head
-  supplies every final classification. The linear family has no learned abstention
-  output: `none` remains zero and `calibrated` remains false.
-- This is a new incremental SGD training path, with class balancing, clipped
-  gradients, and a penalty toward the initial head. A finite candidate must lower
-  replay loss before replacing active weights. This is a stability check, not
-  held-out evidence of better VAD accuracy. The existing batch L-BFGS/CV fitter is
-  unchanged.
+  once. The initial VAD weights reproduce the frozen speech estimate.
+- Default `--policy memory` calls Venn's public `nearest_outcome` API through
+  `AudioCaseStore`. The five nearest cases within cosine distance 0.15 vote on
+  label agreement. A winning margin below 0.2 or missing evidence causes abstention.
+  VAD falls back to the frozen reader; other questions return `none`.
+  These supervised agreement scores are not action rewards or calibrated probabilities.
+- `--policy compiled` uses a current head and its frozen coverage vectors without
+  querying the live case store. Unsupported VAD falls back to Silero. New feedback
+  invalidates the head revision and switches inference to memory until compilation
+  succeeds. Compiled answers report their training revision rather than retrieved cases.
+- Incremental SGD learns the memory policy's answers, with class balancing,
+  clipped gradients, and a penalty toward the initial head. Conflicted targets
+  are excluded. A finite candidate must lower training loss before replacing
+  active weights. Reported memory agreement includes training cases and is not
+  held-out accuracy. The existing batch L-BFGS/CV fitter is unchanged.
 - The explicit `experimental:silero-v6.2-state` profile pins the model, feature
   layout, frame length, and sample rate. These are **not `venn-1` embeddings** and
   cannot be passed to the existing generic head or registered-family HTTP path.
   The streaming API is `VADSession` in `venn/audio/session.py`.
+
+### Reusable states and named questions
+
+Pass `--questions questions.json` with an object such as
+`{"sound": ["fan", "keyboard"]}`. Type `label sound keyboard 2` to label recent
+frames for that question and `ask sound` to re-query the latest retained vector.
+Each question has its own bounded case memory and optional compiled head; all
+reuse the same reader output. Support is limited to eight questions with two to
+eight labels each. The frozen speech features may not distinguish every new label.
+
+Python callers can register questions with `register_question(name, options)`,
+add corrections with `feedback(start, end, label, question=name)`, compile with
+`learn(question=name)`, and re-query retained frames with
+`ask(start, end, questions=[name])`. Re-querying does not run the reader again.
+
+Protocol v2 frame events contain `state.id`, `state.tag`, named `questions`, and
+the VAD `decision` alias. `--vectors` includes `state.vector`. Consumers should
+read `scores` and `score_kind`: memory answers have `probabilities: null`, evidence
+IDs, and feedback-group counts. Model probabilities remain uncalibrated. The VAD
+gate uses the selected speech score; nested `memory` or `compiled` results retain
+the reason when the final decision falls back to the frozen detector.
 
 ### Latency and stream ownership
 
@@ -128,7 +160,7 @@ weight mutation. Audio overflow stops the session rather than silently dropping
 samples or issuing delayed decisions on an invalid timeline. stdout backpressure
 can also fill the queue; consumers should drain events promptly.
 
-Speech onset needs two frames at probability >=0.6; speech offset needs five
+Speech onset needs two frames at speech score >=0.6; speech offset needs five
 frames below 0.35. Start timestamps include 160 ms of pre-roll. These are timestamp
 annotations, not returned audio segments. EOF reports whether speech remains open;
 it is not interpreted as natural silence. VAD does not decide semantic end-of-turn.
@@ -139,17 +171,19 @@ backpressure contribute latency beyond the measured inference time.
 
 Tests cover numerical parity with the existing Torch head on CPU and Metal,
 arbitrary PCM byte boundaries, hysteresis, delayed feedback, bounded memory,
-corrections, learning on synthetic features, and checkpoint round-trips. Run on an
+immediate corrections, shared-vector questions, evidence abstention, compiled
+inference without store queries, checkpoint migration, and round-trips. Run on an
 Apple Silicon process with Metal access:
 
 ```bash
-python -m pytest tests/test_streaming_vad.py -q
+python -m pytest tests/test_audio_memory.py tests/test_streaming_vad.py -q
 ```
 
-An initial local test processed 456 frames from macOS-generated speech surrounded
-by silence: inference p95 was 0.141 ms and maximum was 0.464 ms; one eight-step
-feedback update including checkpoint save took 2.25 ms. This was a single offline
-run, not a microphone latency or speech-accuracy benchmark. Synthetic-feature
+One local test processed 456 frames from macOS-generated speech surrounded
+by silence: memory inference p95 was 0.212 ms and compiled inference p95 was
+0.182 ms; a compilation update including checkpoint save took 7.48 ms. Compiled
+replay used a restored checkpoint and disabled live-store queries. This was a
+single offline run, not a microphone latency or speech-accuracy benchmark. Synthetic-feature
 tests establish that feedback changes predictions; they do not establish improved
 real-world VAD. Evaluate untouched sessions and speakers before claiming that
 adaptation beats the frozen baseline. `benchmark` uses synthetic silence and

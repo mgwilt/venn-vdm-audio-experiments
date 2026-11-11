@@ -23,7 +23,15 @@ def session(args):
     model = Path(args.model_dir) / "silero-v6.2.onnx"
     if not model.exists():
         raise ValueError("Missing model. Run: venn-vad download (or python -m venn.audio download)")
-    return VADSession(SileroReader(model), device=args.device, checkpoint=args.checkpoint)
+    state = VADSession(SileroReader(model), device=args.device, checkpoint=args.checkpoint,
+                       policy=getattr(args, "policy", "memory"), include_vectors=getattr(args, "vectors", False))
+    if getattr(args, "questions", None):
+        questions = json.loads(Path(args.questions).read_text())
+        if not isinstance(questions, dict):
+            raise ValueError("Questions must be a JSON object mapping names to option lists")
+        for name, options in questions.items():
+            state.register_question(name, options)
+    return state
 
 
 def open_wav(path):
@@ -50,15 +58,17 @@ def replay(args):
         labels = json.loads(Path(args.labels).read_text()) if args.labels else []
         if not isinstance(labels, list):
             raise ValueError("Labels must be a JSON list of {start, end, label} intervals")
+        state = session(args)
         for row in labels:
-            if (not isinstance(row, dict) or set(row) != {"start", "end", "label"}
-                    or row["label"] not in ("speech", "background")
+            if (not isinstance(row, dict) or not {"start", "end", "label"} <= set(row)
+                    or set(row) - {"start", "end", "label", "question"}
+                    or row.get("question", "vad") not in state.questions
+                    or row["label"] not in state.questions[row.get("question", "vad")].store.options
                     or not all(isinstance(row[k], (int, float)) and np.isfinite(row[k]) for k in ("start", "end"))
                     or not 0 <= row["start"] < row["end"] <= source.getnframes() // FRAME * FRAME / RATE
                     or row["end"] - row["start"] > 59):
                 raise ValueError("Labels require valid completed-frame intervals of at most 59 seconds")
         labels.sort(key=lambda row: row["end"])
-        state = session(args)
         emit(state.info())
         timings, frames = [], 0
         started = perf_counter()
@@ -74,7 +84,7 @@ def replay(args):
                 while labels and labels[0]["end"] <= event["end"] + 1e-9:
                     row = labels.pop(0)
                     emit(state.feedback(**row))
-                    emit(state.learn())
+                    emit(state.learn(question=row.get("question", "vad")))
         emit(state.finish())
         if state.checkpoint:
             state.save(state.checkpoint)
@@ -85,20 +95,29 @@ def command(state, line):
     """Human-friendly feedback on recent audio, or exact JSON intervals."""
     if line.startswith("{"):
         item = json.loads(line)
-        if not isinstance(item, dict) or set(item) != {"start", "end", "label"}:
-            raise ValueError("Use {start, end, label} feedback")
-        return [state.feedback(**item), state.learn()]
+        if (not isinstance(item, dict) or not {"start", "end", "label"} <= set(item)
+                or set(item) - {"start", "end", "label", "question"}):
+            raise ValueError("Use {start, end, label} feedback with an optional question name")
+        return [state.feedback(**item), state.learn(question=item.get("question", "vad"))]
     parts = line.split()
     if len(parts) == 2 and parts[0] in ("speech", "background"):
         seconds = float(parts[1])
         end = state.samples / RATE
         return [state.feedback(end - seconds, end, parts[0]), state.learn()]
+    if len(parts) == 4 and parts[0] == "label":
+        _, question, label, seconds = parts
+        end = state.samples / RATE
+        return [state.feedback(end - float(seconds), end, label, question=question), state.learn(question=question)]
+    if len(parts) in (1, 2) and parts[0] == "ask":
+        end = state.samples / RATE
+        return [{"type": "answers", "results": state.ask(end - FRAME / RATE, end,
+                 questions=parts[1:] if len(parts) == 2 else None)}]
     if parts == ["reset"]:
         state.reset_learning()
         return [{"type": "reset", "version": state.version}]
     if parts == ["status"]:
         return [state.info()]
-    raise ValueError("Use: speech SECONDS | background SECONDS | reset | status | quit")
+    raise ValueError("Use: speech SECONDS | background SECONDS | label QUESTION OPTION SECONDS | ask [QUESTION] | reset | status | quit")
 
 
 def microphone(args):
@@ -129,7 +148,7 @@ def microphone(args):
             if line.strip() == "quit":
                 return
 
-    print("Feedback: speech 2 | background 2 | reset | status | quit. Times refer to processed audio.", file=sys.stderr)
+    print("Feedback: speech 2 | background 2 | label QUESTION OPTION SECONDS | ask [QUESTION] | reset | status | quit. Times refer to processed audio.", file=sys.stderr)
     # This thread never touches the MLX model. The main worker owns all inference and updates.
     threading.Thread(target=read_commands, daemon=True).start()
     frames = 0
@@ -207,6 +226,10 @@ def main(argv=None):
         child.add_argument("--model-dir", default=".venn-audio/models")
         child.add_argument("--device", choices=("auto", "cpu", "gpu"), default="auto")
         child.add_argument("--checkpoint", help="Load/save learned head and bounded labeled feature memory")
+        child.add_argument("--policy", choices=("memory", "compiled"), default="memory",
+                           help="Use Venn memory, or a current head compiled from its policy; unsupported VAD falls back to the frozen reader")
+        child.add_argument("--questions", type=Path, help="JSON object of additional question names to option lists")
+        child.add_argument("--vectors", action="store_true", help="Include reusable tagged audio vectors in frame events")
         if name == "file":
             child.add_argument("wav", type=Path)
             child.add_argument("--labels", type=Path, help="JSON intervals; applied only after their audio was scored")
