@@ -299,13 +299,10 @@ def test_project_site_works_under_pages_subpath_without_a_backend(tmp_path, monk
         if url.fragment:
             assert url.fragment in parsed[url.path].ids
 
-    assert "install" in parsed["index.html"].ids
+    assert "start" in parsed["index.html"].ids
     index_html = (output / "index.html").read_text(encoding="utf-8")
     assert 'href="venn-and-jev.html"' in index_html
     assert 'href="examples/index.html"' in index_html
-    arena_source = (source / "docs/arena-example.md").read_text(encoding="utf-8")
-    arena_link = re.search(r'<!-- video: venn-arena -->\s+(https://github.com/user-attachments/assets/[\w-]+)\s*\n', arena_source)[1]
-    assert arena_link in (source / "README.md").read_text(encoding="utf-8")
     arena = (output / "arena-example.html").read_text(encoding="utf-8")
     arena_url = ("media/venn-arena.mp4" if (source / "docs/media/venn-arena.mp4").is_file()
                  else build_site.VIDEO_URL)
@@ -317,11 +314,9 @@ def test_project_site_works_under_pages_subpath_without_a_backend(tmp_path, monk
     comparison_url = ("media/venn-same-memory-review.mp4"
                       if (source / "docs/media/venn-same-memory-review.mp4").is_file()
                       else f"{build_site.MEDIA_RELEASE}/venn-same-memory-review.mp4")
-    for page in (index_html, comparison):
-        assert f'<source src="{comparison_url}" type="video/mp4">' in page
-        assert 'poster="media/venn-same-memory-review-poster.jpg"' in page
+    assert f'<source src="{comparison_url}" type="video/mp4">' in comparison
+    assert 'poster="media/venn-same-memory-review-poster.jpg"' in comparison
     for name, stems in {
-        "README.md": ("venn-arena", "venn-same-memory-review"),
         "docs/arena-example.md": ("venn-arena",),
         "docs/venn-and-jev.md": ("venn-same-memory-review",),
         "docs/demos.md": ("venn-arena", "venn-same-memory-review", "venn-precedent-desk"),

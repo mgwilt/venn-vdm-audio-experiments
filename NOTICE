@@ -13,3 +13,11 @@ Reader weights are downloaded separately and are not redistributed here.
 
 Runtime dependencies are installed separately under their own licenses.
 See docs/licenses.md for dependency attribution and data/weight restrictions.
+
+The optional streaming audio reader uses Silero VAD v6.2:
+https://github.com/snakers4/silero-vad
+Pinned revision: be95df9152c0d7618fa1edfeb296fc3dae32376f
+Copyright (c) 2020-present Silero Team. MIT License.
+The NumPy ONNX adapter follows the upstream model/state interface.
+The license is preserved in venn/audio/SILERO-LICENSE; weights are downloaded
+separately by an explicit command and verified against a pinned SHA-256.

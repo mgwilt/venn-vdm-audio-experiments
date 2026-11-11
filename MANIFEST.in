@@ -12,4 +12,5 @@ recursive-include skills *.md
 recursive-include tests *.py *.mjs *.md package.json package-lock.json requirements.txt
 prune tests/clients/node_modules
 prune examples/precedent_desk/data
+prune vendor
 global-exclude __pycache__ *.py[cod] *.sqlite* *.safetensors *.pt *.npy *.npz *.mp4

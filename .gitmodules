@@ -1,0 +1,3 @@
+[submodule "vendor/voicelab"]
+	path = vendor/voicelab
+	url = https://github.com/mgwilt/voicelab.git

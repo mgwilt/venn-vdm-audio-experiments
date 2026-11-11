@@ -32,6 +32,10 @@ def render_navigation(root=ROOT):
     if (root / 'docs/README.md').is_file() and compatibility.is_file():
         entries.append(('overview', compatibility))
     for name, page in entries:
+        # The fork's developer README is hand-authored; keep it linked from the
+        # documentation without inserting the upstream directory and pager.
+        if name == 'index':
+            continue
         original = without_source_navigation(page.read_text(encoding='utf-8')).strip()+'\n'
         def link(target, label):
             destination = posixpath.relpath(sources[target].as_posix(), page.parent.as_posix())

@@ -16,12 +16,24 @@ and :mod:`venn.runtime`.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from venn.server import DecisionService, create_app
-from venn.outcomes import OutcomeService
-from venn.profiles import IMAGE_TAGS, TEXT_TAG, VENN_1, VectorTag
-
 try:
     __version__ = version("venn-vdm")
 except PackageNotFoundError:
     __version__ = "0+source"
 __all__ = ["DecisionService", "OutcomeService", "create_app", "VectorTag", "TEXT_TAG", "IMAGE_TAGS", "VENN_1"]
+
+
+def __getattr__(name):
+    """Keep audio-only processes from loading the Torch/text service."""
+    from importlib import import_module
+
+    modules = {
+        "DecisionService": "venn.server", "create_app": "venn.server",
+        "OutcomeService": "venn.outcomes", "VectorTag": "venn.profiles",
+        "TEXT_TAG": "venn.profiles", "IMAGE_TAGS": "venn.profiles", "VENN_1": "venn.profiles",
+    }
+    if name not in modules:
+        raise AttributeError(f"module 'venn' has no attribute {name!r}")
+    value = getattr(import_module(modules[name]), name)
+    globals()[name] = value
+    return value

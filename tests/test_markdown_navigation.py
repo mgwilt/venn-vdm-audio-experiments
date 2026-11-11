@@ -8,6 +8,7 @@ from scripts import build_site, update_doc_navigation
 def test_markdown_navigation_is_visible_current_and_has_valid_destinations():
     root = Path(__file__).resolve().parents[1]
     expected = update_doc_navigation.render_navigation(root)
+    assert (root / 'README.md') not in expected
     assert (root / 'docs/README.md') in expected
     assert (root / 'docs/overview.md') in expected
     for path, generated in expected.items():

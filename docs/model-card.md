@@ -87,7 +87,7 @@ statement of additional use or modification rights.
 ## Use the model
 
 Follow the Python 3.12 environment setup in the
-[source repository's installation instructions](../README.md#install).
+[installation instructions](installation.md).
 From that checkout, install the reader extra and start the local Decisions API:
 
 ```bash
@@ -100,7 +100,7 @@ venn serve
 The head is downloaded from this Hub repository at the immutable revision
 pinned in the runtime and verified against the checksums above. The frozen
 EmbeddingGemma 2 reader is a separate download, not part of this head bundle.
-Send the [first text decision](../README.md#ask-questions-about-text) or use the
+Send the [first text decision](getting-started.md#serve-text-questions) or use the
 [Python example](../examples/route_ticket.py). For a download-free CPU smoke test,
 run `venn quickstart`; that example uses authored vectors, not this trained head.
 
