@@ -323,7 +323,7 @@ def test_legacy_checkpoint_migrates_labels_but_not_a_false_compilation_claim(tmp
     assert restored.questions["vad"].head_revision is None
     restored.save(path)
     with np.load(path, allow_pickle=False) as saved:
-        assert json.loads(str(saved['metadata'].item()))['schema'] == 2
+        assert json.loads(str(saved['metadata'].item()))['schema'] == 3
 
 
 def test_compiled_head_runs_without_querying_the_live_store(tmp_path, monkeypatch):

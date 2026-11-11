@@ -56,7 +56,12 @@ a file to keep the terminal clear for feedback:
 venn-vad mic --checkpoint .venn-audio/session.npz > .venn-audio/events.jsonl
 ```
 
-While it runs, type `background 2` or `speech 2` to label the last two seconds of
+Automatic VAD teaching is enabled by default: speak normally, then stop with
+Ctrl-C or `quit`. Parakeet supplies delayed speech evidence while the live Venn
+decision loop continues. `venn-vad download` fetches both pinned models; use
+`--teacher none` on download/mic/file for reader-only, manual operation.
+
+Optional corrections: type `background 2` or `speech 2` to label the last two seconds of
 processed audio. Each command labels complete frames, then attempts a bounded
 training update. Use `status`, `reset` (restore the frozen baseline and clear
 learning), or `quit`. Exact intervals are also accepted:
@@ -65,13 +70,14 @@ learning), or `quit`. Exact intervals are also accepted:
 {"start": 1.024, "end": 2.048, "label": "speech"}
 ```
 
-The classifier **learns from explicit feedback**, not from its own predictions.
+The classifier learns from accepted teacher evidence and optional human corrections.
+It never labels examples from its own predictions.
 It starts with frozen-detector behavior. Corrections immediately affect memory;
 head compilation requires at least eight supported memory-policy targets per
 class. Each question retains at most 256 examples per class.
 Feedback must refer to the retained last 60 seconds; relabeling the same frame
 replaces its previous label. Checkpoints preserve the learned head and labeled
-feature memory, question definitions, and compilation revisions across sessions.
+feature memory, label sources, question definitions, and compilation revisions across sessions.
 Legacy checkpoints migrate their examples, but their heads need recompilation
 before use with `--policy compiled`. Checkpoints do not preserve the audio stream's recurrent
 state or timeline. Features may carry information about the source audio.
@@ -79,12 +85,15 @@ state or timeline. Features may carry information about the source audio.
 For repeatable experiments, replay a WAV with optional timestamped feedback:
 
 ```bash
-venn-vad file recording.wav --labels labels.json --checkpoint .venn-audio/session.npz
+venn-vad file recording.wav --checkpoint .venn-audio/session.npz
+venn-vad file recording.wav --teacher none --labels labels.json --checkpoint .venn-audio/manual.npz
 venn-vad benchmark --seconds 30
 ```
 
 WAVs must be uncompressed mono 16 kHz PCM16. `--realtime` paces replay to the audio
-clock. Without it, replay runs as fast as inference allows. A labels file is a JSON
+clock. Live/paced audio never waits for transcription. Unpaced replay waits between
+teacher windows so results arrive before their retained vectors expire. Pass
+`--teacher none` when evaluating a fixed checkpoint. An optional labels file is a JSON
 list such as:
 
 ```json
@@ -98,6 +107,35 @@ Annotations are applied only after the interval has been scored. Annotate spans
 you have checked; a whole utterance may contain pauses that should remain
 background. Every interval must include a full frame and fit within completed
 audio; incomplete final frames are reported and discarded rather than padded.
+
+### Automatic supervision
+
+The pinned Parakeet TDT v3 teacher runs in a spawned process with its own MLX
+runtime. It reads 4.096-second windows every 2.048 seconds, independently of Venn's
+gate. Only one window can be in flight. When transcription falls behind, new
+teacher windows are skipped and counted; the VAD timeline continues unchanged.
+Worker errors are emitted as `teacher_error` and stop automatic supervision.
+
+Speech labels use complete frame interiors of alphanumeric tokens with Parakeet
+entropy confidence >=0.9, avoiding clipped/near-silent frames and window edges.
+This confidence is not a calibrated probability. Negative labels require at least
+256 ms with RMS <=-80 dBFS and peak <=-70 dBFS, outside a 160 ms guard around every
+token, including uncertain tokens. Missing text alone produces no negative label.
+Ordinary noise, uncertain boundaries, and unsupported sounds remain unlabeled.
+These rules favor limited supervision; they are not a ground-truth VAD annotator.
+
+Results target the original retained frames, never the audio arriving when the
+result completes. Expired results and results from before `reset` are discarded.
+Manual labels take precedence and are protected from automatic eviction. Cases
+retain the teacher revision or acoustic-rule source and their window group ID in
+schema 3 checkpoints; schema 1/2 examples migrate as manual evidence.
+
+Memory updates happen on the session owner. Compilation is attempted at most once
+per five seconds of processed audio when memory has changed, and again at clean
+shutdown. Microphone shutdown discards pending inference rather than waiting for
+it; file replay drains pending results and processes a final unpadded window.
+Raw audio is held only in bounded RAM windows/IPC, not written by the teacher.
+Teacher events include transcripts, accepted spans, sources, and processing time.
 
 ### What is Venn, and what is the audio reader?
 
@@ -176,7 +214,7 @@ inference without store queries, checkpoint migration, and round-trips. Run on a
 Apple Silicon process with Metal access:
 
 ```bash
-python -m pytest tests/test_audio_memory.py tests/test_streaming_vad.py -q
+python -m pytest tests/test_audio_memory.py tests/test_audio_teacher.py tests/test_streaming_vad.py -q
 ```
 
 One local test processed 456 frames from macOS-generated speech surrounded
@@ -188,6 +226,11 @@ tests establish that feedback changes predictions; they do not establish improve
 real-world VAD. Evaluate untouched sessions and speakers before claiming that
 adaptation beats the frozen baseline. `benchmark` uses synthetic silence and
 reports warm inference compute only.
+
+An automatic-teaching run on the same 456-frame fixture accepted 210 speech and
+101 near-silence cases without manual labels. Teacher windows took 49–167 ms;
+live frame inference p95 was 0.216 ms. This offline replay demonstrates the
+integration, not labeling accuracy, microphone latency, or improvement over VAD.
 
 The pinned model is explicitly downloaded to `.venn-audio/models` with checksum
 verification. Its MIT license is preserved in `venn/audio/SILERO-LICENSE`; see

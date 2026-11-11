@@ -21,3 +21,14 @@ Copyright (c) 2020-present Silero Team. MIT License.
 The NumPy ONNX adapter follows the upstream model/state interface.
 The license is preserved in venn/audio/SILERO-LICENSE; weights are downloaded
 separately by an explicit command and verified against a pinned SHA-256.
+
+Automatic audio supervision uses NVIDIA Parakeet TDT 0.6B v3:
+https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+Weights license: Creative Commons Attribution 4.0 (CC BY 4.0).
+https://creativecommons.org/licenses/by/4.0/
+MLX conversion: https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3
+Pinned revision: ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15
+The converted weights and upstream model card are downloaded separately with
+SHA-256 verification. They are not redistributed or fine-tuned here.
+The parakeet-mlx 0.7.0 runtime is installed separately under Apache-2.0:
+https://github.com/senstella/parakeet-mlx

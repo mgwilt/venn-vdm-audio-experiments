@@ -45,21 +45,28 @@ class AudioCaseStore:
         self.revision = 0
         self._cache = None
 
-    def put(self, key, vector, label, *, group):
+    def put(self, key, vector, label, *, group, source="manual"):
         x = np.asarray(vector, dtype=np.float32)
         if (x.shape != (self.tag.dimensions,) or label not in self.options
                 or not isinstance(key, str) or not 0 < len(key) <= 128
-                or not isinstance(group, str) or not 0 < len(group) <= 128):
+                or not isinstance(group, str) or not 0 < len(group) <= 128
+                or not isinstance(source, str) or not 0 < len(source) <= 128):
             raise ValueError("Invalid labeled audio case")
         unit(x)
         old = self.cases.get(key)
-        if old is not None and old["label"] == label and np.array_equal(old["vector"], x):
+        if old is not None and old["source"] == "manual" and source != "manual":
             return False
+        if (old is not None and old["label"] == label and np.array_equal(old["vector"], x)
+                and (source != "manual" or old["source"] == "manual")):
+            return False
+        same = [identity for identity, case in self.cases.items() if case["label"] == label and identity != key]
+        if len(same) >= MAX_PER_LABEL:
+            automatic = [identity for identity in same if self.cases[identity]["source"] != "manual"]
+            if source != "manual" and not automatic:
+                return False
+            del self.cases[(automatic or same)[0]]
         self.cases.pop(key, None)
-        self.cases[key] = {"vector": x.copy(), "label": label, "group": group}
-        same = [identity for identity, case in self.cases.items() if case["label"] == label]
-        for identity in same[:-MAX_PER_LABEL]:
-            del self.cases[identity]
+        self.cases[key] = {"vector": x.copy(), "label": label, "group": group, "source": source}
         self.revision += 1
         self._cache = None
         return True
@@ -169,7 +176,8 @@ class AudioQuestion:
                 "reason": reason, "memory_revision": self.store.revision,
                 "evidence": evidence["options"],
                 "cases": [{"id": key, "label": self.store.cases[key]["label"],
-                           "feedback_group": self.store.cases[key]["group"]} for key in ids],
+                           "feedback_group": self.store.cases[key]["group"],
+                           "source": self.store.cases[key]["source"]} for key in ids],
                 "evidence_groups": len({self.store.cases[key]["group"] for key in ids}),
             })
         return answers

@@ -51,6 +51,18 @@ def summary(timings, frames, elapsed):
             "compute_realtime_factor": sum(timings) / 1000 / max(frames * FRAME / RATE, 1e-9)}
 
 
+def automatic_teacher(args):
+    if getattr(args, "teacher", "none") == "none":
+        return None
+    from venn.audio.teacher import AutoTeacher, TeacherProcess, MODEL, REVISION
+
+    print("Loading local Parakeet teacher…", file=sys.stderr)
+    teacher = AutoTeacher(TeacherProcess(args.model_dir))
+    emit({"type": "teacher_ready", "model": MODEL, "revision": REVISION,
+          "mode": "automatic", "labels": "conservative speech and near-silence; uncertain audio stays unlabeled"})
+    return teacher
+
+
 def replay(args):
     # Validate annotations before any inference or checkpoint mutation.
     with open_wav(args.wav) as source:
@@ -70,25 +82,46 @@ def replay(args):
                 raise ValueError("Labels require valid completed-frame intervals of at most 59 seconds")
         labels.sort(key=lambda row: row["end"])
         emit(state.info())
+        teacher = automatic_teacher(args)
         timings, frames = [], 0
         started = perf_counter()
-        while pcm := source.readframes(FRAME):
-            if args.realtime:
-                delay = started + min((frames + 1) * FRAME / RATE, duration) - perf_counter()
-                if delay > 0:
-                    sleep(delay)
-            for event in state.push(pcm):
-                emit(event)
-                timings.append(event["processing_ms"])
-                frames += 1
-                while labels and labels[0]["end"] <= event["end"] + 1e-9:
-                    row = labels.pop(0)
-                    emit(state.feedback(**row))
-                    emit(state.learn(question=row.get("question", "vad")))
-        emit(state.finish())
-        if state.checkpoint:
-            state.save(state.checkpoint)
-        emit(summary(timings, frames, perf_counter() - started), file=sys.stderr)
+        try:
+            while pcm := source.readframes(FRAME):
+                if args.realtime:
+                    delay = started + min((frames + 1) * FRAME / RATE, duration) - perf_counter()
+                    if delay > 0:
+                        sleep(delay)
+                for event in state.push(pcm):
+                    emit(event)
+                    timings.append(event["processing_ms"])
+                    frames += 1
+                    while labels and labels[0]["end"] <= event["end"] + 1e-9:
+                        row = labels.pop(0)
+                        emit(state.feedback(**row))
+                        emit(state.learn(question=row.get("question", "vad")))
+                    if teacher:
+                        for update in teacher.poll(state):
+                            emit(update)
+                        submitted = teacher.feed(pcm, state)
+                        if submitted and not args.realtime:
+                            # Offline replay waits for delayed supervision before advancing.
+                            for update in teacher.drain(state):
+                                emit(update)
+            if teacher:
+                for update in teacher.drain(state):
+                    emit(update)
+                teacher.flush(state)
+                for update in teacher.drain(state):
+                    emit(update)
+                for update in teacher.compile(state, force=True):
+                    emit(update)
+        finally:
+            if teacher:
+                teacher.close()
+            emit(state.finish())
+            if state.checkpoint:
+                state.save(state.checkpoint)
+            emit(summary(timings, frames, perf_counter() - started), file=sys.stderr)
 
 
 def command(state, line):
@@ -125,6 +158,7 @@ def microphone(args):
 
     state = session(args)
     emit(state.info())
+    teacher = automatic_teacher(args)
     audio = queue.Queue(maxsize=8)  # 256 ms maximum backlog; fail rather than score stale audio.
     commands = queue.Queue(maxsize=16)
     failure = threading.Event()
@@ -148,7 +182,10 @@ def microphone(args):
             if line.strip() == "quit":
                 return
 
-    print("Feedback: speech 2 | background 2 | label QUESTION OPTION SECONDS | ask [QUESTION] | reset | status | quit. Times refer to processed audio.", file=sys.stderr)
+    if teacher:
+        print("Automatic teaching is active. Speak normally; Ctrl-C or quit stops. Manual corrections are optional.", file=sys.stderr)
+    else:
+        print("Feedback: speech 2 | background 2 | label QUESTION OPTION SECONDS | ask [QUESTION] | reset | status | quit. Times refer to processed audio.", file=sys.stderr)
     # This thread never touches the MLX model. The main worker owns all inference and updates.
     threading.Thread(target=read_commands, daemon=True).start()
     frames = 0
@@ -161,6 +198,22 @@ def microphone(args):
             while not stop:
                 if failure.is_set():
                     raise RuntimeError("Audio overflow or callback failure; session stopped to preserve its timeline")
+                if teacher:
+                    for update in teacher.poll(state):
+                        emit(update)
+                try:
+                    line = commands.get_nowait()
+                except queue.Empty:
+                    line = None
+                if line == "quit":
+                    # Process one already-captured frame before stopping, if available.
+                    stop = True
+                elif line:
+                    try:
+                        for event in command(state, line):
+                            emit(event)
+                    except (ValueError, TypeError, KeyError) as error:
+                        emit({"type": "feedback_error", "message": str(error)})
                 try:
                     pcm = audio.get(timeout=0.1)
                 except queue.Empty:
@@ -172,23 +225,24 @@ def microphone(args):
                     timings.append(event["processing_ms"])
                     if len(timings) > 10000:
                         del timings[:1000]
-                try:
-                    line = commands.get_nowait()
-                except queue.Empty:
-                    continue
-                if line == "quit":
-                    stop = True
-                else:
-                    try:
-                        for event in command(state, line):
-                            emit(event)
-                    except (ValueError, TypeError, KeyError) as error:
-                        emit({"type": "feedback_error", "message": str(error)})
+                if teacher:
+                    teacher.feed(pcm, state)
     except KeyboardInterrupt:
         pass
     except sd.PortAudioError as error:
         raise RuntimeError(f"Microphone could not run: {error}") from error
     finally:
+        if teacher:
+            # Do not wait on transcription during shutdown. Apply completed work only.
+            try:
+                for update in teacher.poll(state):
+                    emit(update)
+                if teacher.worker.busy:
+                    emit({"type": "teacher_discarded", "reason": "shutdown_with_pending_window"})
+                for update in teacher.compile(state, force=True):
+                    emit(update)
+            finally:
+                teacher.close()
         emit(state.finish())
         if state.checkpoint:
             state.save(state.checkpoint)
@@ -218,8 +272,9 @@ def benchmark(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="mode", required=True)
-    fetch = sub.add_parser("download", help="Download pinned reader weights and license")
+    fetch = sub.add_parser("download", help="Download pinned reader and automatic teacher weights")
     fetch.add_argument("--model-dir", default=".venn-audio/models")
+    fetch.add_argument("--teacher", choices=("parakeet", "none"), default="parakeet")
     sub.add_parser("devices", help="List microphone devices")
     for name in ("file", "mic", "benchmark"):
         child = sub.add_parser(name)
@@ -230,6 +285,9 @@ def main(argv=None):
                            help="Use Venn memory, or a current head compiled from its policy; unsupported VAD falls back to the frozen reader")
         child.add_argument("--questions", type=Path, help="JSON object of additional question names to option lists")
         child.add_argument("--vectors", action="store_true", help="Include reusable tagged audio vectors in frame events")
+        if name != "benchmark":
+            child.add_argument("--teacher", choices=("parakeet", "none"), default="parakeet",
+                               help="Automatic local supervision (default); none enables manual-only operation")
         if name == "file":
             child.add_argument("wav", type=Path)
             child.add_argument("--labels", type=Path, help="JSON intervals; applied only after their audio was scored")
@@ -242,6 +300,9 @@ def main(argv=None):
     try:
         if args.mode == "download":
             emit({"model": str(download(args.model_dir))})
+            if args.teacher == "parakeet":
+                from venn.audio.teacher import download_teacher
+                emit({"teacher_model": str(download_teacher(args.model_dir))})
         elif args.mode == "devices":
             import sounddevice as sd
             print(sd.query_devices())

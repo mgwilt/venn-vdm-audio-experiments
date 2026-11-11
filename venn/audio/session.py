@@ -87,6 +87,8 @@ class VADSession:
         self.samples = 0
         self.history = deque(maxlen=HISTORY_FRAMES)
         self.version = 0
+        self.learning_epoch = 0
+        self.manual_frames = {}
         self.boundaries = Boundaries(boundaries)
         self.checkpoint = Path(checkpoint) if checkpoint else None
         if self.checkpoint and self.checkpoint.exists():
@@ -120,7 +122,7 @@ class VADSession:
                 "profile": PROFILE, "vector_tag": AUDIO_TAG.to_dict(),
                 "classifier": "venn-memory-and-compiled-choice", "labels": LABELS,
                 "policy": self.policy, "device": self.device, "device_median_ms": self.device_timings,
-                "version": self.version, "learning": "explicit-feedback-to-memory",
+                "version": self.version, "learning": "labeled-evidence-to-memory",
                 "calibrated": False, "frame_ms": FRAME * 1000 / RATE,
                 "questions": {name: {"options": q.store.options, "counts": q.store.counts(),
                                      "memory_revision": q.store.revision, "head_revision": q.head_revision}
@@ -201,15 +203,21 @@ class VADSession:
         return [{"state_id": f"{self.session_id}:{sample}", "end": sample / RATE,
                  "answers": self._answers(x, baseline, names)} for sample, x, baseline in self._select(start, end)]
 
-    def feedback(self, start, end, label, *, question="vad"):
+    def feedback(self, start, end, label, *, question="vad", source="manual", group=None):
         q = self.questions.get(question)
         if q is None or label not in q.store.options:
             raise ValueError("Feedback requires a registered question and option label")
         selected = self._select(start, end)
-        group = uuid4().hex
-        changed = sum(q.store.put(f"{self.session_id}:{sample}", x, label, group=group) for sample, x, _ in selected)
+        group = group or uuid4().hex
+        protected = self.manual_frames.setdefault(question, set())
+        protected.intersection_update(sample for sample, _, _ in self.history)
+        if source == "manual":
+            protected.update(sample for sample, _, _ in selected)
+        changed = sum(q.store.put(f"{self.session_id}:{sample}", x, label, group=group, source=source)
+                      for sample, x, _ in selected if source == "manual" or sample not in protected)
         return {"type": "feedback", "question": question, "label": label, "frames": len(selected),
-                "changed_frames": changed, "class_counts": q.store.counts(), "memory_revision": q.store.revision}
+                "changed_frames": changed, "class_counts": q.store.counts(), "memory_revision": q.store.revision,
+                "source": source, "feedback_group": group}
 
     def learn(self, *, question="vad"):
         """Compile the live Venn memory policy into a small MLX head."""
@@ -252,6 +260,8 @@ class VADSession:
         vad.anchor = self.anchor
         vad.head = MLXLinearChoiceHead(*self.anchor, LABELS, device=self.device)
         self.version = 0
+        self.learning_epoch += 1  # Discard delayed teacher results from before reset.
+        self.manual_frames.clear()
         if self.checkpoint:
             self.save(self.checkpoint)
 
@@ -264,14 +274,15 @@ class VADSession:
     def save(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        metadata = {"schema": 2, "profile": PROFILE, "vector_tag": AUDIO_TAG.to_dict(),
+        metadata = {"schema": 3, "profile": PROFILE, "vector_tag": AUDIO_TAG.to_dict(),
                     "version": self.version, "questions": []}
         arrays = {}
         for index, (name, q) in enumerate(self.questions.items()):
             keys, X, _, y = q.store.arrays()
             prefix = f"q{index}_"
             arrays.update({prefix + "X": X, prefix + "y": y, prefix + "keys": np.array(keys, dtype=str),
-                           prefix + "groups": np.array([c["group"] for c in q.store.cases.values()], dtype=str)})
+                           prefix + "groups": np.array([c["group"] for c in q.store.cases.values()], dtype=str),
+                           prefix + "sources": np.array([c["source"] for c in q.store.cases.values()], dtype=str)})
             metadata["questions"].append({"name": name, "options": q.store.options,
                                           "revision": q.store.revision, "head_revision": q.head_revision,
                                           "has_head": q.head is not None,
@@ -299,12 +310,12 @@ class VADSession:
         V1 heads remain available but are marked stale until compiled from memory.
         """
         # Covers eight bounded questions, compiled coverage, and 128-character IDs.
-        if Path(path).stat().st_size > 40_000_000:
+        if Path(path).stat().st_size > 48_000_000:
             raise ValueError("Checkpoint exceeds size limit")
         restored = {}
         with np.load(path, allow_pickle=False) as saved:
             meta = json.loads(str(saved["metadata"].item()))
-            if not isinstance(meta, dict) or meta.get("profile") != PROFILE or meta.get("schema") not in (1, 2):
+            if not isinstance(meta, dict) or meta.get("profile") != PROFILE or meta.get("schema") not in (1, 2, 3):
                 raise ValueError("Checkpoint audio profile or schema does not match")
             if type(meta.get("version")) is not int or meta["version"] < 0:
                 raise ValueError("Invalid checkpoint version")
@@ -330,11 +341,13 @@ class VADSession:
                 prefix = "" if legacy else f"q{index}_"
                 X, y, keys = saved[prefix + "X"], saved[prefix + "y"], saved[prefix + "keys"]
                 groups = np.array(["legacy"] * len(X)) if legacy else saved[prefix + "groups"]
+                sources = saved[prefix + "sources"] if meta["schema"] == 3 else np.full(len(X), "manual")
                 if (X.ndim != 2 or X.shape[1] != DIMENSIONS or len(X) > MAX_PER_LABEL * len(options)
                         or y.shape != (len(X),) or keys.shape != (len(X),) or groups.shape != (len(X),)
                         or not np.isfinite(X).all() or not np.issubdtype(y.dtype, np.integer)
                         or not np.isin(y, np.arange(len(options))).all()
                         or keys.dtype.kind != 'U' or groups.dtype.kind != 'U'
+                        or sources.shape != (len(X),) or sources.dtype.kind != 'U'
                         or len(set(keys.tolist())) != len(keys)
                         or np.max(np.bincount(y, minlength=len(options))) > MAX_PER_LABEL):
                     raise ValueError("Invalid checkpoint replay data")
@@ -343,8 +356,8 @@ class VADSession:
                         or head_revision is not None and (type(head_revision) is not int or not 0 <= head_revision <= revision)
                         or type(spec["has_head"]) is not bool or head_revision is not None and not spec["has_head"]):
                     raise ValueError("Invalid checkpoint memory revision")
-                for key, x, label, group in zip(keys, X, y, groups):
-                    q.store.put(str(key), x, options[int(label)], group=str(group))
+                for key, x, label, group, source in zip(keys, X, y, groups, sources):
+                    q.store.put(str(key), x, options[int(label)], group=str(group), source=str(source))
                 q.store.revision = revision
                 q.head_revision = head_revision
                 if not legacy and spec.get("compilation") is not None:
