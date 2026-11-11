@@ -1,13 +1,28 @@
 # Venn Audio Experiments
 
-An experiment in adapting voice activity detection (VAD) to a session without retraining the audio reader.
-This fork of [Venn](https://github.com/markrussinovich/venn-vdm) uses its core pattern: encode audio once,
-reuse the vectors across questions, make decisions from remembered examples, and compile those decisions
-into small MLX heads for Apple Silicon.
+Venn for streaming audio on Apple Silicon. This fork of [Venn](https://github.com/markrussinovich/venn-vdm)
+tests whether reusable audio vectors and editable session memory can support decisions that adapt during
+use. Voice activity detection (VAD) is the first task.
 
-A frozen Silero reader produces a tagged vector every 32 ms. Venn's `OutcomeService` queries labeled
-session memory and returns supporting case IDs. Corrections affect memory immediately; unsupported or
-conflicting VAD evidence falls back to Silero. Whether this improves accuracy is still an open experiment.
+Venn separates the audio representation from the decisions made over it. The same vectors can answer
+multiple questions, corrections become retrievable evidence, and small MLX heads learn from memory's
+decisions. That makes session adaptation possible without retraining the reader for each question.
+
+## Decision loop
+
+```text
+audio → tagged vectors → Venn memory → decisions + evidence
+                              ↓
+feedback → corrected cases → compiled MLX heads
+```
+
+Each 32 ms frame is encoded once. Venn's `OutcomeService` retrieves nearby labeled cases for each
+registered question. Feedback changes those answers immediately; head compilation learns the resulting
+memory policy. Questions can be re-evaluated over retained vectors without processing the audio again.
+
+Default `--policy memory` queries cases on every frame. `--policy compiled` uses a current head and its
+saved coverage check without querying the live store. New feedback invalidates stale heads until
+recompilation succeeds. Unsupported questions abstain; VAD has a frozen-detector fallback.
 
 ## Start
 
@@ -24,7 +39,7 @@ venn-vad devices
 venn-vad mic --checkpoint .venn-audio/session.npz > .venn-audio/events.jsonl
 ```
 
-`download` fetches the pinned Silero model and verifies its checksum. Choose a microphone with
+`download` fetches the pinned audio reader and verifies its checksum. Choose a microphone with
 `--input-device NUMBER` if the system default is unsuitable. Events are written as newline-delimited
 JSON; inspect them in another terminal with `tail -f .venn-audio/events.jsonl`.
 
@@ -45,10 +60,6 @@ Feedback can cover the last 60 seconds. Each command stores corrections, then tr
 decisions into a head; compilation needs at least eight supported targets per class. Memory retains up
 to 256 examples per label. Checkpoints preserve questions, cases, and heads across sessions. Listening
 alone does not train anything.
-
-Default `--policy memory` queries examples on every frame. Use `--policy compiled` to run a current MLX
-head with its saved coverage check, without querying the live store. New feedback makes that head stale
-until recompilation succeeds; inference uses memory in the meantime.
 
 ## Reuse the vectors
 
@@ -103,9 +114,10 @@ The benchmark measures warm inference on synthetic silence, not microphone laten
 | Microphone capture, WAV replay, feedback, and benchmarks | `venn/audio/cli.py` / `venn-vad` |
 | Pinned VoiceLab reference submodule | `vendor/voicelab` |
 
-The streaming path uses its own audio feature profile, not `venn-1` embeddings. It runs locally through
-`venn-vad` or `VADSession`; it is not wired into Venn's existing HTTP family API. The inherited `venn`
-CLI and batch classifiers remain available. The audio process does not load Torch or the text reader.
+The current reader uses frozen Silero features under an experimental audio vector profile. These are
+not `venn-1` embeddings. The streaming runtime is exposed through `venn-vad` and `VADSession`, separately
+from Venn's existing HTTP family API. The inherited `venn` CLI and batch classifiers remain available;
+the audio process does not load Torch or the text reader.
 
 [VoiceLab](https://github.com/mgwilt/voicelab) supplies implementation references, not a runtime dependency.
 For an existing clone, initialize it with `git submodule update --init --recursive`.
@@ -123,6 +135,7 @@ python scripts/update_doc_navigation.py --check
 
 Tests cover CPU/Metal parity, immediate corrections, shared-vector questions, evidence abstention,
 compiled inference without live-store queries, checkpoint migration, streaming boundaries, and queue overflow.
+Improvement over fixed VAD still needs evaluation on held-out recordings.
 If macOS reports duplicate OpenMP runtimes when testing Torch/FAISS together, run
 `DYLD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/torch/lib" python -m pytest -q`.
 Local models, checkpoints, and recordings belong in the ignored `.venn-audio/` directory.
